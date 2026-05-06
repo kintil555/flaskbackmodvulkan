@@ -60,6 +60,10 @@ import static org.lwjgl.opengl.GL11.*;
 
 public class ReplayUI {
 
+    /** VulkanMod replaces the OpenGL backend — ImGui's GL3 renderer must be disabled. */
+    private static final boolean VULKANMOD_PRESENT =
+        net.fabricmc.loader.api.FabricLoader.getInstance().isModLoaded("vulkanmod");
+
     public static final CustomImGuiImplGlfw imguiGlfw = new CustomImGuiImplGlfw();
     private static final CustomImGuiImplGl3 imguiGl3 = new CustomImGuiImplGl3();
     private static boolean initialized = false;
@@ -159,7 +163,9 @@ public class ReplayUI {
         imGuiIO.setConfigMacOSXBehaviors(InputQuirks.REPLACE_CTRL_KEY_WITH_CMD_KEY);
 
         imguiGlfw.init(Minecraft.getInstance().getWindow().handle(), true);
-        imguiGl3.init("#version 150");
+        if (!VULKANMOD_PRESENT) {
+            imguiGl3.init("#version 150");
+        }
 
         contentScale = imguiGlfw.contentScale;
         initFonts(languageCode);
@@ -277,7 +283,9 @@ public class ReplayUI {
         fontConfig.setMergeMode(false);
 
         fonts.build();
-        imguiGl3.updateFontsTexture();
+        if (!VULKANMOD_PRESENT) {
+            imguiGl3.updateFontsTexture();
+        }
 
         fontConfig.destroy();
         fonts.clearTexData();
@@ -590,7 +598,9 @@ public class ReplayUI {
         }
 
         imguiGlfw.newFrame();
-        imguiGl3.newFrame();
+        if (!VULKANMOD_PRESENT) {
+            imguiGl3.newFrame();
+        }
         ImGui.newFrame();
 
         hasAnyPopupOpen = ImGui.isPopupOpen("", ImGuiPopupFlags.AnyPopup);
@@ -932,7 +942,7 @@ public class ReplayUI {
         GLFW.glfwMakeContextCurrent(ctx);
 
         var drawData = ImGui.getDrawData();
-        if (drawData != null) {
+        if (drawData != null && !VULKANMOD_PRESENT) {
             imguiGl3.renderDrawData(drawData);
         }
 
