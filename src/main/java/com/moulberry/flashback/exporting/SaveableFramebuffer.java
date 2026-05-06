@@ -1,11 +1,15 @@
 package com.moulberry.flashback.exporting;
 
+import com.mojang.blaze3d.buffers.BufferType;
+import com.mojang.blaze3d.buffers.BufferUsage;
+import com.mojang.blaze3d.buffers.GpuBuffer;
 import com.mojang.blaze3d.opengl.GlDevice;
 import com.mojang.blaze3d.opengl.GlStateManager;
 import com.mojang.blaze3d.opengl.GlTexture;
 import com.mojang.blaze3d.platform.NativeImage;
 import com.mojang.blaze3d.systems.RenderSystem;
 import com.mojang.blaze3d.textures.GpuTexture;
+import net.fabricmc.loader.api.FabricLoader;
 import org.jetbrains.annotations.Nullable;
 import org.lwjgl.opengl.GL11;
 import org.lwjgl.opengl.GL30;
@@ -16,14 +20,29 @@ import java.nio.ByteBuffer;
 import java.nio.FloatBuffer;
 
 public class SaveableFramebuffer implements AutoCloseable {
-    private int pboId;
-    public @Nullable FloatBuffer audioBuffer;
 
+    /**
+     * When VulkanMod is present, raw GL PBO calls (glGenBuffers, glReadPixels,
+     * glMapBuffer) will crash because VulkanMod replaces the OpenGL backend.
+     * We detect it once at class-load time and use a GPU-abstraction path instead.
+     */
+    private static final boolean VULKANMOD_PRESENT =
+        FabricLoader.getInstance().isModLoaded("vulkanmod");
+
+    // OpenGL PBO path (vanilla / Sodium)
+    private int pboId = -1;
+
+    // Vulkan-safe path: GPU buffer abstraction provided by blaze3d
+    private @Nullable GpuBuffer gpuDownloadBuffer;
+
+    public @Nullable FloatBuffer audioBuffer;
     private boolean isDownloading = false;
 
-    public SaveableFramebuffer() {
-        this.pboId = -1;
-    }
+    public SaveableFramebuffer() {}
+
+    // ------------------------------------------------------------------
+    // Public API
+    // ------------------------------------------------------------------
 
     public void startDownload(GpuTexture gpuTexture, int width, int height) {
         if (this.isDownloading) {
@@ -31,15 +50,51 @@ public class SaveableFramebuffer implements AutoCloseable {
         }
         this.isDownloading = true;
 
+        if (VULKANMOD_PRESENT) {
+            startDownloadVulkan(gpuTexture, width, height);
+        } else {
+            startDownloadGL(gpuTexture, width, height);
+        }
+    }
+
+    public NativeImage finishDownload(int width, int height) {
+        if (!this.isDownloading) {
+            throw new IllegalStateException("Can't finish downloading before download has started");
+        }
+        this.isDownloading = false;
+
+        if (VULKANMOD_PRESENT) {
+            return finishDownloadVulkan(width, height);
+        } else {
+            return finishDownloadGL(width, height);
+        }
+    }
+
+    @Override
+    public void close() {
+        if (this.pboId != -1) {
+            GL30C.glDeleteBuffers(this.pboId);
+            this.pboId = -1;
+        }
+        if (this.gpuDownloadBuffer != null) {
+            this.gpuDownloadBuffer.close();
+            this.gpuDownloadBuffer = null;
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // OpenGL PBO path (vanilla / Sodium / Iris)
+    // ------------------------------------------------------------------
+
+    private void startDownloadGL(GpuTexture gpuTexture, int width, int height) {
         if (this.pboId == -1) {
             this.pboId = GL30C.glGenBuffers();
-
             GL30C.glBindBuffer(GL30C.GL_PIXEL_PACK_BUFFER, this.pboId);
             GL30C.glBufferData(GL30C.GL_PIXEL_PACK_BUFFER, (long) width * height * 4, GL30C.GL_STREAM_READ);
             GL30C.glBindBuffer(GL30C.GL_PIXEL_PACK_BUFFER, 0);
         }
 
-        int fbo = ((GlTexture)gpuTexture).getFbo(((GlDevice)RenderSystem.getDevice()).directStateAccess(), null);
+        int fbo = ((GlTexture) gpuTexture).getFbo(((GlDevice) RenderSystem.getDevice()).directStateAccess(), null);
         GlStateManager._glBindFramebuffer(GL30.GL_FRAMEBUFFER, fbo);
 
         GL30C.glBindBuffer(GL30C.GL_PIXEL_PACK_BUFFER, this.pboId);
@@ -53,12 +108,7 @@ public class SaveableFramebuffer implements AutoCloseable {
         GlStateManager._glBindFramebuffer(GL30.GL_FRAMEBUFFER, 0);
     }
 
-    public NativeImage finishDownload(int width, int height) {
-        if (!this.isDownloading) {
-            throw new IllegalStateException("Can't finish downloading before download has started");
-        }
-        this.isDownloading = false;
-
+    private NativeImage finishDownloadGL(int width, int height) {
         NativeImage nativeImage = new NativeImage(NativeImage.Format.RGBA, width, height, false);
 
         GL30C.glBindBuffer(GL30C.GL_PIXEL_PACK_BUFFER, this.pboId);
@@ -68,7 +118,6 @@ public class SaveableFramebuffer implements AutoCloseable {
             throw new IllegalStateException("OpenGL error occurred while mapping buffer");
         }
 
-        // Copy bytes
         MemoryUtil.memCopy(MemoryUtil.memAddress(buffer), nativeImage.pixels, nativeImage.size);
 
         GL30C.glUnmapBuffer(GL30C.GL_PIXEL_PACK_BUFFER);
@@ -77,11 +126,44 @@ public class SaveableFramebuffer implements AutoCloseable {
         return nativeImage;
     }
 
-    public void close() {
-        if (this.pboId != -1) {
-            GL30C.glDeleteBuffers(this.pboId);
-            this.pboId = -1;
+    // ------------------------------------------------------------------
+    // Vulkan-safe path
+    // Uses blaze3d GpuBuffer which VulkanMod routes through its own
+    // Vulkan staging-buffer abstraction — no raw GL_PIXEL_PACK_BUFFER.
+    // ------------------------------------------------------------------
+
+    private void startDownloadVulkan(GpuTexture gpuTexture, int width, int height) {
+        int size = width * height * 4;
+
+        // Re-allocate if the buffer is too small
+        if (this.gpuDownloadBuffer == null || this.gpuDownloadBuffer.size() < size) {
+            if (this.gpuDownloadBuffer != null) {
+                this.gpuDownloadBuffer.close();
+            }
+            this.gpuDownloadBuffer = RenderSystem.getDevice().createBuffer(
+                () -> "flashback pixel download",
+                BufferType.PIXEL_PACK,
+                BufferUsage.STREAM_READ,
+                size
+            );
         }
+
+        // Async copy: texture → buffer via device command encoder
+        RenderSystem.getDevice().createCommandEncoder()
+            .copyTextureToBuffer(gpuTexture, this.gpuDownloadBuffer, 0, () -> {}, width, height);
     }
 
+    private NativeImage finishDownloadVulkan(int width, int height) {
+        NativeImage nativeImage = new NativeImage(NativeImage.Format.RGBA, width, height, false);
+
+        try (GpuBuffer.ReadView view = this.gpuDownloadBuffer.readWithoutFence(0, width * height * 4)) {
+            ByteBuffer data = view.asByteBuffer();
+            if (data == null) {
+                throw new IllegalStateException("Failed to map GPU download buffer (Vulkan path)");
+            }
+            MemoryUtil.memCopy(MemoryUtil.memAddress(data), nativeImage.pixels, nativeImage.size);
+        }
+
+        return nativeImage;
+    }
 }

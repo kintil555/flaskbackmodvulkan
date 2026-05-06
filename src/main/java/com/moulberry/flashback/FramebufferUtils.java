@@ -36,9 +36,15 @@ import java.util.OptionalInt;
 
 public class FramebufferUtils {
 
+    /** True when VulkanMod is present — skip raw GL framebuffer queries. */
+    private static final boolean VULKANMOD_PRESENT =
+        net.fabricmc.loader.api.FabricLoader.getInstance().isModLoaded("vulkanmod");
+
     public static void clear(RenderTarget renderTarget, int colour) {
-        int oldReadFbo = GL11.glGetInteger(GL30.GL_READ_FRAMEBUFFER_BINDING);
-        int oldDrawFbo = GL11.glGetInteger(GL30.GL_DRAW_FRAMEBUFFER_BINDING);
+        // Raw glGetInteger on framebuffer bindings crashes under VulkanMod.
+        // The save/restore is only needed for vanilla OpenGL.
+        int oldReadFbo = VULKANMOD_PRESENT ? 0 : GL11.glGetInteger(GL30.GL_READ_FRAMEBUFFER_BINDING);
+        int oldDrawFbo = VULKANMOD_PRESENT ? 0 : GL11.glGetInteger(GL30.GL_DRAW_FRAMEBUFFER_BINDING);
 
         GpuTexture colourTexture = renderTarget.getColorTexture();
         GpuTexture depthTexture = renderTarget.getDepthTexture();
@@ -50,8 +56,10 @@ public class FramebufferUtils {
             RenderSystem.getDevice().createCommandEncoder().clearDepthTexture(depthTexture, 1.0f);
         }
 
-        GlStateManager._glBindFramebuffer(GL32.GL_READ_FRAMEBUFFER, oldReadFbo);
-        GlStateManager._glBindFramebuffer(GL32.GL_DRAW_FRAMEBUFFER, oldDrawFbo);
+        if (!VULKANMOD_PRESENT) {
+            GlStateManager._glBindFramebuffer(GL32.GL_READ_FRAMEBUFFER, oldReadFbo);
+            GlStateManager._glBindFramebuffer(GL32.GL_DRAW_FRAMEBUFFER, oldDrawFbo);
+        }
     }
 
     public static RenderTarget resizeOrCreateFramebuffer(RenderTarget renderTarget, int width, int height) {
@@ -107,8 +115,9 @@ public class FramebufferUtils {
     public static void blitToScreenPartial(RenderTarget renderTarget, int width, int height, float x1, float y1, float x2, float y2) {
         GlStateManager._viewport(0, 0, width, height);
 
-        int oldReadFbo = GL11.glGetInteger(GL30.GL_READ_FRAMEBUFFER_BINDING);
-        int oldDrawFbo = GL11.glGetInteger(GL30.GL_DRAW_FRAMEBUFFER_BINDING);
+        // Raw glGetInteger on FBO bindings crashes under VulkanMod — skip save/restore there.
+        int oldReadFbo = VULKANMOD_PRESENT ? 0 : GL11.glGetInteger(GL30.GL_READ_FRAMEBUFFER_BINDING);
+        int oldDrawFbo = VULKANMOD_PRESENT ? 0 : GL11.glGetInteger(GL30.GL_DRAW_FRAMEBUFFER_BINDING);
 
         tempRenderTarget = FramebufferUtils.resizeOrCreateFramebuffer(tempRenderTarget, width, height);
         FramebufferUtils.clear(tempRenderTarget, 0);
@@ -117,8 +126,10 @@ public class FramebufferUtils {
 
         tempRenderTarget.blitToScreen();
 
-        GlStateManager._glBindFramebuffer(GL32.GL_READ_FRAMEBUFFER, oldReadFbo);
-        GlStateManager._glBindFramebuffer(GL32.GL_DRAW_FRAMEBUFFER, oldDrawFbo);
+        if (!VULKANMOD_PRESENT) {
+            GlStateManager._glBindFramebuffer(GL32.GL_READ_FRAMEBUFFER, oldReadFbo);
+            GlStateManager._glBindFramebuffer(GL32.GL_DRAW_FRAMEBUFFER, oldDrawFbo);
+        }
     }
 
 }
