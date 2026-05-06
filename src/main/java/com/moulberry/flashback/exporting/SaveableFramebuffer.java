@@ -1,12 +1,11 @@
 package com.moulberry.flashback.exporting;
 
-import com.mojang.blaze3d.buffers.BufferType;
-import com.mojang.blaze3d.buffers.BufferUsage;
 import com.mojang.blaze3d.buffers.GpuBuffer;
 import com.mojang.blaze3d.opengl.GlDevice;
 import com.mojang.blaze3d.opengl.GlStateManager;
 import com.mojang.blaze3d.opengl.GlTexture;
 import com.mojang.blaze3d.platform.NativeImage;
+import com.mojang.blaze3d.systems.CommandEncoder;
 import com.mojang.blaze3d.systems.RenderSystem;
 import com.mojang.blaze3d.textures.GpuTexture;
 import net.fabricmc.loader.api.FabricLoader;
@@ -140,24 +139,26 @@ public class SaveableFramebuffer implements AutoCloseable {
             if (this.gpuDownloadBuffer != null) {
                 this.gpuDownloadBuffer.close();
             }
+            // USAGE_COPY_DST: target of copyTextureToBuffer
+            // USAGE_MAP_READ: so we can map it for CPU readback
             this.gpuDownloadBuffer = RenderSystem.getDevice().createBuffer(
                 () -> "flashback pixel download",
-                BufferType.PIXEL_PACK,
-                BufferUsage.STREAM_READ,
-                size
+                GpuBuffer.USAGE_COPY_DST | GpuBuffer.USAGE_MAP_READ,
+                (long) size
             );
         }
 
         // Async copy: texture → buffer via device command encoder
         RenderSystem.getDevice().createCommandEncoder()
-            .copyTextureToBuffer(gpuTexture, this.gpuDownloadBuffer, 0, () -> {}, width, height);
+            .copyTextureToBuffer(gpuTexture, this.gpuDownloadBuffer, 0L, () -> {}, 0, 0, 0, width, height);
     }
 
     private NativeImage finishDownloadVulkan(int width, int height) {
         NativeImage nativeImage = new NativeImage(NativeImage.Format.RGBA, width, height, false);
 
-        try (GpuBuffer.ReadView view = this.gpuDownloadBuffer.readWithoutFence(0, width * height * 4)) {
-            ByteBuffer data = view.asByteBuffer();
+        CommandEncoder encoder = RenderSystem.getDevice().createCommandEncoder();
+        try (GpuBuffer.MappedView view = encoder.mapBuffer(this.gpuDownloadBuffer, true, false)) {
+            ByteBuffer data = view.data();
             if (data == null) {
                 throw new IllegalStateException("Failed to map GPU download buffer (Vulkan path)");
             }
