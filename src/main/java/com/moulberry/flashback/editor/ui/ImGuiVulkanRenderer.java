@@ -14,6 +14,7 @@ import com.moulberry.flashback.visuals.ShaderManager;
 import imgui.moulberry90.ImDrawData;
 import imgui.moulberry90.ImFontAtlas;
 import imgui.moulberry90.ImGui;
+import imgui.moulberry90.ImVec4;
 import imgui.moulberry90.type.ImInt;
 import net.minecraft.client.Minecraft;
 import org.joml.Matrix4f;
@@ -27,30 +28,26 @@ import java.util.OptionalInt;
 /**
  * Vulkan-safe ImGui renderer for Flashback.
  *
- * ── Root cause of the "UI invisible" bug ──────────────────────────────────────
+ * ROOT CAUSE OF THE BUG:
+ *   When VulkanMod is active, there is NO active OpenGL context.
+ *   CustomImGuiImplGl3 calls glGenTextures() → returns 0 (null texture),
+ *   and renderDrawData() calls glDrawElements() → no-op.
+ *   Result: every ImGui window (Timeline, Visuals, Export…) produces zero pixels.
  *
- * When VulkanMod is active, there is NO live OpenGL context.
- * CustomImGuiImplGl3 relies entirely on raw OpenGL calls:
- *   1. updateFontsTexture() → glGenTextures() returns 0 → fontAtlas.texID = 0
- *   2. renderDrawData()     → gl* calls are no-ops → zero pixels produced
+ * FIX:
+ *   Use Blaze3D GpuDevice abstraction (RenderSystem.getDevice()) for everything.
+ *   VulkanMod routes these calls to Vulkan; vanilla routes them to OpenGL.
  *
- * Result: Timeline, Visuals, Export windows — the entire Flashback UI — is
- * completely invisible when VulkanMod is loaded.
+ * VERTEX FORMAT:
+ *   ImDrawVert = 20 bytes: [pos.xy:8][uv.xy:8][col:4]
+ *   DefaultVertexFormat.POSITION_TEX_COLOR = 24 bytes: [pos.xyz:12][uv.xy:8][col:4]
+ *   We expand on the CPU by inserting pos.z=0.0f at offset 8 of each vertex
+ *   before uploading to GpuBuffer — no custom vertex format needed.
  *
- * ── Fix ───────────────────────────────────────────────────────────────────────
- *
- * Route everything through Blaze3D's GpuDevice abstraction, which VulkanMod
- * overrides to use Vulkan instead of OpenGL.
- *
- * ── Vertex format ─────────────────────────────────────────────────────────────
- *
- * ImDrawVert = 20 bytes: [pos.x:4][pos.y:4][uv.x:4][uv.y:4][col:4]
- * DefaultVertexFormat.POSITION_TEX_COLOR = 24 bytes:
- *   [pos.x:4][pos.y:4][pos.z:4][uv.x:4][uv.y:4][col:4]
- *
- * We expand each vertex on the CPU by inserting pos.z = 0.0f (4 zero bytes)
- * at offset 8 before uploading to GpuBuffer.  This costs one extra memcopy per
- * draw-list per frame but avoids registering a custom VertexFormat.
+ * API notes (verified against this codebase):
+ *   GpuDevice.createBuffer(label, flags, ByteBuffer)  — create+fill in one call
+ *   getCmdListCmdBufferClipRect(ImVec4 dst, listIdx, cmdIdx) — fills dst.x/y/z/w
+ *   getSamplerCache().getClampToEdge(FilterMode)       — correct sampler method
  */
 public class ImGuiVulkanRenderer {
 
@@ -58,17 +55,11 @@ public class ImGuiVulkanRenderer {
     private GpuTexture     fontTexture;
     private GpuTextureView fontTextureView;
 
-    // ── Reusable scratch buffers ──────────────────────────────────────────────
-    /** CPU-side staging buffer (expanded vertex data). */
+    // ── Reusable CPU staging buffer for vertex expansion ──────────────────────
     private ByteBuffer stagingBuffer;
 
-    /** GPU vertex buffer (POSITION_TEX_COLOR layout, 24 bytes/vertex). */
-    private GpuBuffer vtxGpuBuffer;
-    private int       vtxGpuCapacity;
-
-    /** GPU index buffer (uint16). */
-    private GpuBuffer idxGpuBuffer;
-    private int       idxGpuCapacity;
+    // ── Clip-rect scratch object (reused per draw-command) ────────────────────
+    private final ImVec4 clipRect = new ImVec4();
 
     /** ImDrawVert size in bytes. */
     private static final int IMGUI_VTX = 20;
@@ -78,8 +69,8 @@ public class ImGuiVulkanRenderer {
     // ─────────────────────────────────────────────────────────────────────────
 
     /**
-     * Upload the ImGui font atlas to a GpuTexture (Vulkan/GL-safe).
-     * Must be called after {@link ImFontAtlas#build()} and any time fonts are rebuilt.
+     * Upload the ImGui font atlas to a Blaze3D GpuTexture.
+     * Must be called after {@link ImFontAtlas#build()}.
      */
     public void createFontsTexture() {
         destroyFontsTexture();
@@ -102,18 +93,16 @@ public class ImGuiVulkanRenderer {
             1  // mipLevels
         );
 
-        // writeToTexture(target, buf, format, mipLevel, depth, offsetX, offsetY, w, h)
         pixels.limit(w * h * 4).position(0);
         RenderSystem.getDevice().createCommandEncoder()
             .writeToTexture(fontTexture, pixels, NativeImage.Format.RGBA, 0, 0, 0, 0, w, h);
 
         fontTextureView = RenderSystem.getDevice().createTextureView(fontTexture);
 
-        // Sentinel ID = 1: all ImGui draw-calls reference the font atlas.
+        // Sentinel ID=1 — renderDrawData() maps all texture IDs to fontTextureView.
         fonts.setTexID(1);
     }
 
-    /** Free font GPU resources. */
     public void destroyFontsTexture() {
         if (fontTextureView != null) { fontTextureView.close(); fontTextureView = null; }
         if (fontTexture     != null) { fontTexture.close();     fontTexture     = null; }
@@ -139,8 +128,8 @@ public class ImGuiVulkanRenderer {
         float clipOffX = drawData.getDisplayPosX();
         float clipOffY = drawData.getDisplayPosY();
 
-        // Orthographic projection: ImGui uses top-left as (0,0).
-        // ortho(L, R, Bottom, Top, near, far) — Bottom > Top flips Y.
+        // Orthographic projection: ImGui uses top-left = (0,0).
+        // ortho(L, R, Bottom, Top) — Bottom > Top flips the Y axis.
         Matrix4f ortho = new Matrix4f().ortho(
             clipOffX,
             clipOffX + drawData.getDisplaySizeX(),
@@ -153,72 +142,55 @@ public class ImGuiVulkanRenderer {
 
         for (int listIdx = 0; listIdx < cmdListsCount; listIdx++) {
 
-            // ── Expand and upload vertices ────────────────────────────────────
-            int vtxCount  = drawData.getCmdListVtxBufferSize(listIdx);
-            int srcBytes  = vtxCount * IMGUI_VTX;
-            int dstBytes  = vtxCount * MC_VTX;
+            // ── Build expanded vertex buffer ──────────────────────────────────
+            int vtxCount = drawData.getCmdListVtxBufferSize(listIdx);
+            int srcBytes = vtxCount * IMGUI_VTX;
+            int dstBytes = vtxCount * MC_VTX;
 
             ByteBuffer vtxSrc = drawData.getCmdListVtxBufferData(listIdx);
             vtxSrc.limit(srcBytes).position(0);
 
-            // Ensure staging buffer is large enough
+            // Grow staging buffer if needed (native memory, freed in dispose())
             if (stagingBuffer == null || stagingBuffer.capacity() < dstBytes) {
                 if (stagingBuffer != null) MemoryUtil.memFree(stagingBuffer);
                 stagingBuffer = MemoryUtil.memAlloc(Math.max(dstBytes, 4096 * MC_VTX));
             }
             stagingBuffer.limit(dstBytes).position(0);
 
-            // Expand: insert pos.z = 0.0f at byte offset 8 of each vertex
-            // ImDrawVert: [px:4][py:4][u:4][v:4][col:4]  (20 bytes)
-            // MC layout:  [px:4][py:4][pz:4][u:4][v:4][col:4]  (24 bytes)
+            // Insert pos.z = 0.0f at byte offset 8 of each vertex
+            // ImDrawVert: [px:4][py:4][u:4][v:4][col:4]       (20 bytes)
+            // MC layout:  [px:4][py:4][pz:4][u:4][v:4][col:4] (24 bytes)
             for (int i = 0; i < vtxCount; i++) {
-                int src = i * IMGUI_VTX;
-                int dst = i * MC_VTX;
-                // pos.x, pos.y  (8 bytes)
-                stagingBuffer.putFloat(dst,     vtxSrc.getFloat(src));
-                stagingBuffer.putFloat(dst + 4, vtxSrc.getFloat(src + 4));
-                // pos.z = 0.0f  (4 bytes, injected)
-                stagingBuffer.putFloat(dst + 8, 0.0f);
-                // uv.x, uv.y   (8 bytes)
-                stagingBuffer.putFloat(dst + 12, vtxSrc.getFloat(src + 8));
-                stagingBuffer.putFloat(dst + 16, vtxSrc.getFloat(src + 12));
-                // color (4 bytes)
-                stagingBuffer.putInt(dst + 20, vtxSrc.getInt(src + 16));
+                int s = i * IMGUI_VTX;
+                int d = i * MC_VTX;
+                stagingBuffer.putFloat(d,      vtxSrc.getFloat(s));      // pos.x
+                stagingBuffer.putFloat(d + 4,  vtxSrc.getFloat(s + 4));  // pos.y
+                stagingBuffer.putFloat(d + 8,  0.0f);                    // pos.z = 0
+                stagingBuffer.putFloat(d + 12, vtxSrc.getFloat(s + 8));  // uv.x
+                stagingBuffer.putFloat(d + 16, vtxSrc.getFloat(s + 12)); // uv.y
+                stagingBuffer.putInt  (d + 20, vtxSrc.getInt  (s + 16)); // color
             }
             stagingBuffer.position(0);
 
-            // Upload to GPU
-            if (vtxGpuBuffer == null || vtxGpuCapacity < dstBytes) {
-                if (vtxGpuBuffer != null) vtxGpuBuffer.close();
-                int cap = Math.max(dstBytes, 4096 * MC_VTX);
-                vtxGpuBuffer = RenderSystem.getDevice().createBuffer(
-                    () -> "imgui_vtx",
-                    GpuBuffer.USAGE_VERTEX | GpuBuffer.USAGE_COPY_DST,
-                    cap
-                );
-                vtxGpuCapacity = cap;
-            }
-            RenderSystem.getDevice().createCommandEncoder()
-                .writeToBuffer(vtxGpuBuffer, stagingBuffer, 0);
+            // createBuffer(label, flags, ByteBuffer) — creates and uploads in one call
+            // (mirrors FlashbackDrawBuffer.uploadVertexBuffer() pattern)
+            GpuBuffer vtxGpu = RenderSystem.getDevice().createBuffer(
+                () -> "imgui_vtx",
+                GpuBuffer.USAGE_VERTEX,
+                stagingBuffer
+            );
 
-            // ── Upload indices ────────────────────────────────────────────────
+            // ── Upload index buffer ───────────────────────────────────────────
             int idxCount = drawData.getCmdListIdxBufferSize(listIdx);
             int idxBytes = idxCount * 2; // ImDrawIdx = uint16
-            ByteBuffer idxData = drawData.getCmdListIdxBufferData(listIdx);
+            ByteBuffer idxSrc = drawData.getCmdListIdxBufferData(listIdx);
+            idxSrc.limit(idxBytes).position(0);
 
-            if (idxGpuBuffer == null || idxGpuCapacity < idxBytes) {
-                if (idxGpuBuffer != null) idxGpuBuffer.close();
-                int cap = Math.max(idxBytes, 8192 * 2);
-                idxGpuBuffer = RenderSystem.getDevice().createBuffer(
-                    () -> "imgui_idx",
-                    GpuBuffer.USAGE_INDEX | GpuBuffer.USAGE_COPY_DST,
-                    cap
-                );
-                idxGpuCapacity = cap;
-            }
-            idxData.limit(idxBytes).position(0);
-            RenderSystem.getDevice().createCommandEncoder()
-                .writeToBuffer(idxGpuBuffer, idxData, 0);
+            GpuBuffer idxGpu = RenderSystem.getDevice().createBuffer(
+                () -> "imgui_idx",
+                GpuBuffer.USAGE_INDEX,
+                idxSrc
+            );
 
             // ── Issue draw commands ───────────────────────────────────────────
             int cmdCount = drawData.getCmdListCmdBufferSize(listIdx);
@@ -229,14 +201,16 @@ public class ImGuiVulkanRenderer {
                 int idxOffset = drawData.getCmdListCmdBufferIdxOffset(listIdx, cmdIdx);
                 int vtxOffset = drawData.getCmdListCmdBufferVtxOffset(listIdx, cmdIdx);
 
-                float cx1 = (drawData.getCmdListCmdBufferClipRect(listIdx, cmdIdx, 0) - clipOffX) * fbScaleX;
-                float cy1 = (drawData.getCmdListCmdBufferClipRect(listIdx, cmdIdx, 1) - clipOffY) * fbScaleY;
-                float cx2 = (drawData.getCmdListCmdBufferClipRect(listIdx, cmdIdx, 2) - clipOffX) * fbScaleX;
-                float cy2 = (drawData.getCmdListCmdBufferClipRect(listIdx, cmdIdx, 3) - clipOffY) * fbScaleY;
+                // getCmdListCmdBufferClipRect fills clipRect.x/y/z/w
+                drawData.getCmdListCmdBufferClipRect(clipRect, listIdx, cmdIdx);
+                float cx1 = (clipRect.x - clipOffX) * fbScaleX;
+                float cy1 = (clipRect.y - clipOffY) * fbScaleY;
+                float cx2 = (clipRect.z - clipOffX) * fbScaleX;
+                float cy2 = (clipRect.w - clipOffY) * fbScaleY;
 
                 if (cx1 >= displayW || cy1 >= displayH || cx2 < 0 || cy2 < 0) continue;
 
-                // Write per-draw transform into DynamicUniforms ring buffer
+                // DynamicTransforms = orthographic projection + colour modulator
                 GpuBufferSlice dynTransforms = RenderSystem.getDynamicUniforms().writeTransform(
                     ortho,
                     new Vector4f(1.0f, 1.0f, 1.0f, 1.0f),
@@ -255,7 +229,6 @@ public class ImGuiVulkanRenderer {
                     RenderSystem.bindDefaultUniforms(pass);
                     pass.setUniform("DynamicTransforms", dynTransforms);
 
-                    // Scissor: enableScissor(x, y, width, height)
                     int sx = (int) Math.max(0.0f, cx1);
                     int sy = (int) Math.max(0.0f, cy1);
                     int sw = (int) Math.min(displayW, cx2) - sx;
@@ -264,23 +237,26 @@ public class ImGuiVulkanRenderer {
                         pass.enableScissor(sx, sy, sw, sh);
                     }
 
-                    pass.setVertexBuffer(0, vtxGpuBuffer);
-                    pass.setIndexBuffer(idxGpuBuffer, VertexFormat.IndexType.SHORT);
+                    pass.setVertexBuffer(0, vtxGpu);
+                    pass.setIndexBuffer(idxGpu, VertexFormat.IndexType.SHORT);
+                    // getClampToEdge is the correct method — getLinear does not exist
                     pass.bindTexture("InSampler", fontTextureView,
-                        RenderSystem.getSamplerCache().getLinear(FilterMode.LINEAR));
+                        RenderSystem.getSamplerCache().getClampToEdge(FilterMode.LINEAR));
 
                     // drawIndexed(baseVertex, firstIndex, indexCount, instanceCount)
                     pass.drawIndexed(vtxOffset, idxOffset, elemCount, 1);
                 }
             }
+
+            // Free per-frame GPU buffers (created fresh every frame)
+            vtxGpu.close();
+            idxGpu.close();
         }
     }
 
     /** Release all GPU and CPU resources. */
     public void dispose() {
         destroyFontsTexture();
-        if (vtxGpuBuffer != null) { vtxGpuBuffer.close(); vtxGpuBuffer = null; }
-        if (idxGpuBuffer != null) { idxGpuBuffer.close(); idxGpuBuffer = null; }
         if (stagingBuffer != null) {
             MemoryUtil.memFree(stagingBuffer);
             stagingBuffer = null;
