@@ -66,8 +66,6 @@ public class ReplayUI {
 
     public static final CustomImGuiImplGlfw imguiGlfw = new CustomImGuiImplGlfw();
     private static final CustomImGuiImplGl3 imguiGl3 = new CustomImGuiImplGl3();
-    /** Vulkan-safe ImGui renderer — used instead of imguiGl3 when VulkanMod is present. */
-    private static ImGuiVulkanRenderer imguiVulkan = null;
     private static boolean initialized = false;
 
     private static boolean isFrameFocused = false;
@@ -165,11 +163,11 @@ public class ReplayUI {
         imGuiIO.setConfigMacOSXBehaviors(InputQuirks.REPLACE_CTRL_KEY_WITH_CMD_KEY);
 
         imguiGlfw.init(Minecraft.getInstance().getWindow().handle(), true);
-        if (!VULKANMOD_PRESENT) {
-            imguiGl3.init("#version 150");
-        } else {
-            imguiVulkan = new ImGuiVulkanRenderer();
-        }
+        // Always use GL3 renderer. When VulkanMod is present its GL compatibility
+        // layer intercepts all LWJGL OpenGL calls (glDrawElements, glBindTexture, etc.)
+        // and routes them into the active Vulkan command buffer — so CustomImGuiImplGl3
+        // works correctly even under Vulkan. ImGuiVulkanRenderer is no longer needed.
+        imguiGl3.init("#version 150");
 
         contentScale = imguiGlfw.contentScale;
         initFonts(languageCode);
@@ -287,11 +285,7 @@ public class ReplayUI {
         fontConfig.setMergeMode(false);
 
         fonts.build();
-        if (!VULKANMOD_PRESENT) {
-            imguiGl3.updateFontsTexture();
-        } else if (imguiVulkan != null) {
-            imguiVulkan.createFontsTexture();
-        }
+        imguiGl3.updateFontsTexture();
 
         fontConfig.destroy();
         fonts.clearTexData();
@@ -606,9 +600,7 @@ public class ReplayUI {
         }
 
         imguiGlfw.newFrame();
-        if (!VULKANMOD_PRESENT) {
-            imguiGl3.newFrame();
-        }
+        imguiGl3.newFrame();
         ImGui.newFrame();
 
         hasAnyPopupOpen = ImGui.isPopupOpen("", ImGuiPopupFlags.AnyPopup);
@@ -953,11 +945,7 @@ public class ReplayUI {
 
         var drawData = ImGui.getDrawData();
         if (drawData != null) {
-            if (!VULKANMOD_PRESENT) {
-                imguiGl3.renderDrawData(drawData);
-            } else if (imguiVulkan != null) {
-                imguiVulkan.renderDrawData(drawData);
-            }
+            imguiGl3.renderDrawData(drawData);
         }
 
         if (frameX != oldFrameX || frameY != oldFrameY || frameWidth != oldFrameWidth || frameHeight != oldFrameHeight) {
