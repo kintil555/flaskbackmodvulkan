@@ -1,8 +1,7 @@
 package com.moulberry.flashback.mixin.compat.vulkanmod;
 
-import com.moulberry.flashback.Flashback;
+import com.moulberry.flashback.editor.ui.ReplayUI;
 import com.moulberry.mixinconstraints.annotations.IfModLoaded;
-import net.minecraft.client.Minecraft;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Pseudo;
 import org.spongepowered.asm.mixin.injection.At;
@@ -10,15 +9,20 @@ import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 /**
- * VulkanMod replaces Minecraft's OpenGL renderer. Several subsystems in
- * Flashback (exporting, framebuffer blit) call raw GL functions that crash
- * when VulkanMod is active.
+ * VulkanMod replaces Minecraft's OpenGL renderer with Vulkan.
  *
- * This mixin targets VulkanMod's Renderer class to detect the Vulkan context
- * and suppress Flashback operations that are known-incompatible at the raw GL
- * level. The actual pixel-download path is handled in SaveableFramebuffer via
- * the VULKANMOD_PRESENT flag; this mixin provides the guard at the Renderer
- * tick level so export-in-progress state is kept coherent.
+ * Critically, VulkanMod's MinecraftMixin does:
+ *   1. @Inject beginFrame() at HEAD of runTick → acquires swapchain image, starts recording
+ *   2. @Redirect blitToScreen()                → NO-OP (removed entirely)
+ *   3. @Redirect glfwSwapBuffers               → endFrame() = submit commands + present
+ *
+ * This means BEFORE/AFTER blitToScreen inject points are useless — blitToScreen
+ * never runs. VulkanMod renders directly to its Vulkan swapchain image, bypassing
+ * mainRenderTarget for final output. ImGui rendering to mainRenderTarget is invisible.
+ *
+ * FIX: Hook Renderer.endFrame() at HEAD — VulkanMod's command buffer is still
+ * recording at this point. Our Blaze3D RenderPass calls (ImGuiVulkanRenderer)
+ * get recorded into the same command buffer and appear in the final frame.
  */
 @IfModLoaded("vulkanmod")
 @Pseudo
@@ -26,18 +30,12 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 public class MixinVulkanModRenderSystem {
 
     /**
-     * Called each frame by VulkanMod's Renderer.beginFrame() equivalent.
-     * We use this as a hook to confirm Vulkan is active and warn if
-     * Flashback is in an export state that still uses raw GL (failsafe log).
+     * Render the Flashback ImGui overlay just before VulkanMod submits
+     * and presents the frame. require=0 so a future VulkanMod rename
+     * silently skips this rather than crashing.
      */
-    @Inject(method = "beginFrame", at = @At("HEAD"), require = 0, cancellable = false)
-    public void flashback$onBeginFrame(CallbackInfo ci) {
-        // Intentionally lightweight: just confirm the renderer is Vulkan-backed.
-        // Heavy compatibility work is done in SaveableFramebuffer / FramebufferUtils.
-        if (Flashback.isExporting()) {
-            // Export is running under Vulkan — the GpuBuffer path in
-            // SaveableFramebuffer handles pixel download safely.
-            // No action needed here; this hook exists for future extension.
-        }
+    @Inject(method = "endFrame", at = @At("HEAD"), require = 0)
+    public void flashback$onEndFrame(CallbackInfo ci) {
+        ReplayUI.drawOverlay();
     }
 }
