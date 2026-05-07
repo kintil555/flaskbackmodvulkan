@@ -80,7 +80,7 @@ public class ImGuiMcRenderer {
 
         fontGpuTexture = RenderSystem.getDevice().createTexture(
             () -> "flashback:imgui_font_atlas",
-            GpuTexture.USAGE_COPY_DST | GpuTexture.USAGE_RENDER_ATTACHMENT | GpuTexture.USAGE_SAMPLER,
+            GpuTexture.USAGE_COPY_DST | GpuTexture.USAGE_RENDER_ATTACHMENT | GpuTexture.USAGE_TEXTURE_BINDING,
             TextureFormat.RGBA8,
             width, height,
             1, 1
@@ -174,8 +174,8 @@ public class ImGuiMcRenderer {
         float clipOffX = drawData.getDisplayPosX();
         float clipOffY = drawData.getDisplayPosY();
 
-        var bufferSource = guiGraphics.bufferSource();
-
+        // bufferSource() was removed in MC 1.21.2; use drawSpecial(Consumer<MultiBufferSource>)
+        // which internally flushes and ends the batch after the consumer runs.
         for (int listIdx = 0; listIdx < cmdListsCount; listIdx++) {
             int vtxCount = drawData.getCmdListVtxBufferSize(listIdx);
             ByteBuffer vtxBuf = drawData.getCmdListVtxBufferData(listIdx);
@@ -199,13 +199,11 @@ public class ImGuiMcRenderer {
 
                 if (cx1 >= displayW || cy1 >= displayH || cx2 < 0 || cy2 < 0) continue;
 
-                int sx = (int) Math.max(0, cx1);
-                int sy = (int) Math.max(0, cy1);
+                int sx  = (int) Math.max(0, cx1);
+                int sy  = (int) Math.max(0, cy1);
                 int sx2 = (int) Math.min(displayW, cx2);
                 int sy2 = (int) Math.min(displayH, cy2);
 
-                // Flush before changing scissor
-                bufferSource.endLastBatch();
                 guiGraphics.enableScissor(sx, sy, sx2, sy2);
 
                 // Get index buffer for this draw command
@@ -213,36 +211,43 @@ public class ImGuiMcRenderer {
                 // ImDrawIdx = uint16, offset in shorts
                 idxBuf.position(idxOffset * 2);
 
-                VertexConsumer vc = bufferSource.getBuffer(fontRenderType);
+                // Capture loop variables for the lambda
+                final ByteBuffer finalVtxBuf = vtxBuf;
+                final ByteBuffer finalIdxBuf  = idxBuf;
+                final int        finalElemCount = elemCount;
+                final int        finalVtxOffset = vtxOffset;
 
-                // Emit triangles: elemCount indices = elemCount/3 triangles
-                for (int i = 0; i < elemCount; i++) {
-                    int idx = (idxBuf.getShort() & 0xFFFF) + vtxOffset;
-                    int vBase = idx * 20; // ImDrawVert size = 20 bytes
+                // drawSpecial replaces bufferSource(): provides a MultiBufferSource,
+                // submits the geometry, and ends the batch automatically.
+                guiGraphics.drawSpecial(bufferSource -> {
+                    VertexConsumer vc = bufferSource.getBuffer(fontRenderType);
 
-                    float px   = vtxBuf.getFloat(vBase);
-                    float py   = vtxBuf.getFloat(vBase + 4);
-                    float u    = vtxBuf.getFloat(vBase + 8);
-                    float v    = vtxBuf.getFloat(vBase + 12);
-                    int   col  = vtxBuf.getInt  (vBase + 16); // ABGR in ImGui
+                    // Emit triangles: elemCount indices
+                    for (int i = 0; i < finalElemCount; i++) {
+                        int idx  = (finalIdxBuf.getShort() & 0xFFFF) + finalVtxOffset;
+                        int vBase = idx * 20; // ImDrawVert size = 20 bytes
 
-                    // ImGui color = 0xAABBGGRR, Minecraft VertexConsumer wants ARGB
-                    int a = (col >> 24) & 0xFF;
-                    int b = (col >> 16) & 0xFF;
-                    int g = (col >>  8) & 0xFF;
-                    int r = (col      ) & 0xFF;
+                        float px  = finalVtxBuf.getFloat(vBase);
+                        float py  = finalVtxBuf.getFloat(vBase + 4);
+                        float u   = finalVtxBuf.getFloat(vBase + 8);
+                        float v   = finalVtxBuf.getFloat(vBase + 12);
+                        int   col = finalVtxBuf.getInt  (vBase + 16); // ABGR in ImGui
 
-                    vc.addVertex(px, py, 0.0f)
-                      .setUv(u, v)
-                      .setColor(r, g, b, a);
-                }
+                        // ImGui color = 0xAABBGGRR, Minecraft VertexConsumer wants ARGB
+                        int a = (col >> 24) & 0xFF;
+                        int b = (col >> 16) & 0xFF;
+                        int g = (col >>  8) & 0xFF;
+                        int r = (col      ) & 0xFF;
 
-                bufferSource.endLastBatch();
+                        vc.addVertex(px, py, 0.0f)
+                          .setUv(u, v)
+                          .setColor(r, g, b, a);
+                    }
+                });
+
                 guiGraphics.disableScissor();
             }
         }
-
-        bufferSource.endBatch();
     }
 
     public void dispose() {
