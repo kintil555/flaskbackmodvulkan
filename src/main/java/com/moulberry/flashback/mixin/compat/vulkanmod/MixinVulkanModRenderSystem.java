@@ -1,5 +1,6 @@
 package com.moulberry.flashback.mixin.compat.vulkanmod;
 
+import com.mojang.blaze3d.systems.RenderSystem;
 import com.moulberry.flashback.editor.ui.ReplayUI;
 import com.moulberry.mixinconstraints.annotations.IfModLoaded;
 import net.minecraft.client.Minecraft;
@@ -46,7 +47,7 @@ public class MixinVulkanModRenderSystem {
         require = 0
     )
     public void flashback$beforeBlitToScreen(boolean bl, CallbackInfo ci) {
-        if (!net.minecraft.client.renderer.RenderSystem.isOnRenderThread()) return;
+        if (!RenderSystem.isOnRenderThread()) return;
         ReplayUI.drawOverlay();
     }
 }
