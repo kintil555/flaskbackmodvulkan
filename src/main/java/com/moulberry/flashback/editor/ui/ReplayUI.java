@@ -66,7 +66,13 @@ public class ReplayUI {
 
     public static final CustomImGuiImplGlfw imguiGlfw = new CustomImGuiImplGlfw();
     private static final CustomImGuiImplGl3 imguiGl3 = new CustomImGuiImplGl3();
-    private static ImGuiVulkanRenderer imguiVulkanRenderer = null;
+    /**
+     * When VulkanMod is active, imguiGl3 cannot be initialized at startup because
+     * GL.getCapabilities() throws with no OpenGL context. We defer init to the first
+     * drawOverlayInternal() call which runs inside VulkanMod's MainPass where the
+     * GL compat layer is fully active and intercepts all GL calls correctly.
+     */
+    private static boolean gl3Initialized = false;
     private static boolean initialized = false;
 
     private static boolean isFrameFocused = false;
@@ -164,14 +170,13 @@ public class ReplayUI {
         imGuiIO.setConfigMacOSXBehaviors(InputQuirks.REPLACE_CTRL_KEY_WITH_CMD_KEY);
 
         imguiGlfw.init(Minecraft.getInstance().getWindow().handle(), true);
-        if (VULKANMOD_PRESENT) {
-            // VulkanMod replaces the OpenGL context entirely — calling GL functions
-            // outside an active Vulkan render pass causes EXCEPTION_ACCESS_VIOLATION.
-            // Use the Blaze3D-abstracted ImGuiVulkanRenderer instead.
-            imguiVulkanRenderer = new ImGuiVulkanRenderer();
-        } else {
+        if (!VULKANMOD_PRESENT) {
+            // OpenGL path: initialize immediately, GL context is available.
             imguiGl3.init("#version 150");
+            gl3Initialized = true;
         }
+        // Vulkan path: imguiGl3 init is deferred to first drawOverlayInternal()
+        // call so it runs inside VulkanMod's MainPass (GL compat layer active).
 
         contentScale = imguiGlfw.contentScale;
         initFonts(languageCode);
@@ -289,11 +294,11 @@ public class ReplayUI {
         fontConfig.setMergeMode(false);
 
         fonts.build();
-        if (VULKANMOD_PRESENT && imguiVulkanRenderer != null) {
-            imguiVulkanRenderer.createFontsTexture();
-        } else {
+        if (gl3Initialized) {
             imguiGl3.updateFontsTexture();
         }
+        // If gl3 not yet initialized (Vulkan lazy-init path), fonts texture will be
+        // uploaded in ensureGl3Initialized() on the first drawOverlayInternal() call.
 
         fontConfig.destroy();
         fonts.clearTexData();
@@ -565,6 +570,25 @@ public class ReplayUI {
         }
     }
 
+    /**
+     * Ensures imguiGl3 is initialized. For the VulkanMod path this is deferred to the
+     * first frame render so that GL calls happen inside an active Vulkan MainPass.
+     * VulkanMod's GL compatibility layer intercepts all GL calls (glGenTextures,
+     * glDrawElements, etc.) and routes them to the active Vulkan command buffer.
+     */
+    private static void ensureGl3Initialized() {
+        if (gl3Initialized) return;
+        long oldCtx = ImGui.getCurrentContext().ptr;
+        ImGui.setCurrentContext(imGuiContext);
+        imguiGl3.init("#version 150");
+        gl3Initialized = true;
+        // Upload font atlas now that GL is available
+        imguiGl3.updateFontsTexture();
+        ImGuiContext ctx = ImGui.getCurrentContext();
+        ctx.ptr = oldCtx;
+        ImGui.setCurrentContext(ctx);
+    }
+
     public static void drawOverlayInternal() {
         int oldFrameX = frameX;
         int oldFrameY = frameY;
@@ -573,6 +597,12 @@ public class ReplayUI {
 
         if (!initialized) {
             throw new IllegalStateException("Tried to use EditorUI while it was not initialized");
+        }
+
+        // Vulkan path: initialize imguiGl3 lazily on the first real render call.
+        // At this point VulkanMod's MainPass is active and GL compat layer is live.
+        if (VULKANMOD_PRESENT) {
+            ensureGl3Initialized();
         }
 
         if (Minecraft.getInstance().screen instanceof ProgressScreen || Minecraft.getInstance().screen instanceof LevelLoadingScreen) {
@@ -608,7 +638,7 @@ public class ReplayUI {
         }
 
         imguiGlfw.newFrame();
-        if (!VULKANMOD_PRESENT) {
+        if (gl3Initialized) {
             imguiGl3.newFrame();
         }
         ImGui.newFrame();
@@ -955,11 +985,7 @@ public class ReplayUI {
 
         var drawData = ImGui.getDrawData();
         if (drawData != null) {
-            if (VULKANMOD_PRESENT && imguiVulkanRenderer != null) {
-                imguiVulkanRenderer.renderDrawData(drawData);
-            } else {
-                imguiGl3.renderDrawData(drawData);
-            }
+            imguiGl3.renderDrawData(drawData);
         }
 
         if (frameX != oldFrameX || frameY != oldFrameY || frameWidth != oldFrameWidth || frameHeight != oldFrameHeight) {
