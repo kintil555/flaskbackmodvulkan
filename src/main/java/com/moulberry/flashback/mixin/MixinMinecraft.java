@@ -173,9 +173,27 @@ public abstract class MixinMinecraft extends ReentrantBlockableEventLoop<Runnabl
         original.call(instance, camera);
     }
 
+    /**
+     * VulkanMod path: render ImGui BEFORE blitToScreen() so that the UI is
+     * already in the RenderTarget when VulkanMod blits it to the swapchain image.
+     * After blitToScreen() is too late — VulkanMod presents the swapchain immediately.
+     */
+    @Inject(method = "runTick", at=@At(value = "INVOKE", target = "Lcom/mojang/blaze3d/pipeline/RenderTarget;blitToScreen()V", shift = At.Shift.BEFORE))
+    public void beforeMainBlit(boolean bl, CallbackInfo ci) {
+        if (!RenderSystem.isOnRenderThread()) return;
+        if (!net.fabricmc.loader.api.FabricLoader.getInstance().isModLoaded("vulkanmod")) return;
+        ReplayUI.drawOverlay();
+    }
+
+    /**
+     * Vanilla OpenGL path: render ImGui AFTER blitToScreen() so that it draws
+     * directly to the default framebuffer (the real screen), not the RenderTarget
+     * (which blitToScreen would overwrite if we rendered before).
+     */
     @Inject(method = "runTick", at=@At(value = "INVOKE", target = "Lcom/mojang/blaze3d/pipeline/RenderTarget;blitToScreen()V", shift = At.Shift.AFTER))
     public void afterMainBlit(boolean bl, CallbackInfo ci) {
         if (!RenderSystem.isOnRenderThread()) return;
+        if (net.fabricmc.loader.api.FabricLoader.getInstance().isModLoaded("vulkanmod")) return;
         ReplayUI.drawOverlay();
     }
 
