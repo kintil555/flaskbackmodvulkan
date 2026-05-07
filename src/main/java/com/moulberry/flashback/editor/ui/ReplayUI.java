@@ -24,6 +24,7 @@ import imgui.moulberry90.internal.ImGuiContext;
 import imgui.moulberry90.type.ImInt;
 import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.gui.GuiGraphics;
 import net.minecraft.client.gui.screens.LevelLoadingScreen;
 import net.minecraft.client.gui.screens.LoadingOverlay;
 import net.minecraft.client.gui.screens.ProgressScreen;
@@ -73,6 +74,16 @@ public class ReplayUI {
      * GL compat layer is fully active and intercepts all GL calls correctly.
      */
     private static boolean gl3Initialized = false;
+    /**
+     * Vulkan path: renders ImGui draw data via Minecraft VertexConsumer/RenderType,
+     * which VulkanMod intercepts correctly. Null when VulkanMod is not present.
+     */
+    private static ImGuiMcRenderer imguiMcRenderer = null;
+    /**
+     * Passed from MixinGui.render() so renderDrawData() can use it. Only used
+     * in the Vulkan path. Cleared at the end of each frame.
+     */
+    public static GuiGraphics currentGuiGraphics = null;
     private static boolean initialized = false;
 
     private static boolean isFrameFocused = false;
@@ -174,9 +185,12 @@ public class ReplayUI {
             // OpenGL path: initialize immediately, GL context is available.
             imguiGl3.init("#version 150");
             gl3Initialized = true;
+        } else {
+            // Vulkan path: use Minecraft VertexConsumer renderer.
+            // Font texture upload is deferred to ensureGl3Initialized() which
+            // runs inside the Gui.render() call where GpuDevice is ready.
+            imguiMcRenderer = new ImGuiMcRenderer();
         }
-        // Vulkan path: imguiGl3 init is deferred to first drawOverlayInternal()
-        // call so it runs inside VulkanMod's MainPass (GL compat layer active).
 
         contentScale = imguiGlfw.contentScale;
         initFonts(languageCode);
@@ -294,11 +308,13 @@ public class ReplayUI {
         fontConfig.setMergeMode(false);
 
         fonts.build();
-        if (gl3Initialized) {
+        if (VULKANMOD_PRESENT && imguiMcRenderer != null) {
+            imguiMcRenderer.createFontsTexture();
+        } else if (gl3Initialized) {
             imguiGl3.updateFontsTexture();
         }
-        // If gl3 not yet initialized (Vulkan lazy-init path), fonts texture will be
-        // uploaded in ensureGl3Initialized() on the first drawOverlayInternal() call.
+        // If gl3 not yet initialized (OpenGL lazy-init edge case), fonts texture will
+        // be uploaded in ensureGl3Initialized() on the first drawOverlayInternal() call.
 
         fontConfig.destroy();
         fonts.clearTexData();
@@ -577,6 +593,11 @@ public class ReplayUI {
      * glDrawElements, etc.) and routes them to the active Vulkan command buffer.
      */
     private static void ensureGl3Initialized() {
+        if (VULKANMOD_PRESENT) {
+            // Vulkan path: ImGuiMcRenderer, font texture uploaded once at startup
+            // via createFontsTexture(). Nothing to do here.
+            return;
+        }
         if (gl3Initialized) return;
         long oldCtx = ImGui.getCurrentContext().ptr;
         ImGui.setCurrentContext(imGuiContext);
@@ -985,7 +1006,12 @@ public class ReplayUI {
 
         var drawData = ImGui.getDrawData();
         if (drawData != null) {
-            imguiGl3.renderDrawData(drawData);
+            if (VULKANMOD_PRESENT && imguiMcRenderer != null && currentGuiGraphics != null) {
+                imguiMcRenderer.renderDrawData(drawData, currentGuiGraphics);
+                currentGuiGraphics = null;
+            } else if (!VULKANMOD_PRESENT) {
+                imguiGl3.renderDrawData(drawData);
+            }
         }
 
         if (frameX != oldFrameX || frameY != oldFrameY || frameWidth != oldFrameWidth || frameHeight != oldFrameHeight) {

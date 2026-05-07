@@ -36,9 +36,10 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 @Mixin(targets = "net.vulkanmod.vulkan.Renderer", remap = false)
 public class MixinVulkanModRenderSystem {
 
-    @Inject(method = "endFrame", at = @At("HEAD"), require = 0)
-    public void flashback$onEndFrame(CallbackInfo ci) {
-        if (!RenderSystem.isOnRenderThread()) return;
-        ReplayUI.drawOverlay();
-    }
+    // drawOverlay() for the Vulkan path is now triggered from MixinGui.render_vulkanDrawOverlay()
+    // (at Gui.render() RETURN) so that it runs inside an active render pass with
+    // GuiGraphics available. This hook is intentionally disabled.
+    //
+    // @Inject(method = "endFrame", at = @At("HEAD"), require = 0)
+    // public void flashback$onEndFrame(CallbackInfo ci) { ... }
 }

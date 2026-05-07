@@ -39,6 +39,17 @@ public abstract class MixinGui {
     @Unique
     private boolean shouldHideElements = false;
 
+    @Inject(method = "render", at = @At("RETURN"))
+    public void render_vulkanDrawOverlay(GuiGraphics guiGraphics, DeltaTracker deltaTracker, CallbackInfo ci) {
+        // Vulkan path: ImGui is rendered here, inside Gui.render(), where VulkanMod's
+        // GL compat / RenderType pipeline is fully active. We pass GuiGraphics so that
+        // ImGuiMcRenderer can use VertexConsumer for Vulkan-safe rendering.
+        if (net.fabricmc.loader.api.FabricLoader.getInstance().isModLoaded("vulkanmod")) {
+            ReplayUI.currentGuiGraphics = guiGraphics;
+            ReplayUI.drawOverlay();
+        }
+    }
+
     @Inject(method = "render", at = @At("HEAD"))
     public void render_updateCameraGameType(GuiGraphics guiGraphics, DeltaTracker deltaTracker, CallbackInfo ci) {
         this.shouldHideElements = false;
