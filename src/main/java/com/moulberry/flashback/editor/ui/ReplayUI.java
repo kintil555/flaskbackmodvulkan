@@ -66,6 +66,8 @@ public class ReplayUI {
 
     public static final CustomImGuiImplGlfw imguiGlfw = new CustomImGuiImplGlfw();
     private static final CustomImGuiImplGl3 imguiGl3 = new CustomImGuiImplGl3();
+    /** Vulkan-safe ImGui renderer — used instead of imguiGl3 when VulkanMod is present. */
+    private static ImGuiVulkanRenderer imguiVulkan = null;
     private static boolean initialized = false;
 
     private static boolean isFrameFocused = false;
@@ -165,6 +167,8 @@ public class ReplayUI {
         imguiGlfw.init(Minecraft.getInstance().getWindow().handle(), true);
         if (!VULKANMOD_PRESENT) {
             imguiGl3.init("#version 150");
+        } else {
+            imguiVulkan = new ImGuiVulkanRenderer();
         }
 
         contentScale = imguiGlfw.contentScale;
@@ -285,6 +289,8 @@ public class ReplayUI {
         fonts.build();
         if (!VULKANMOD_PRESENT) {
             imguiGl3.updateFontsTexture();
+        } else if (imguiVulkan != null) {
+            imguiVulkan.createFontsTexture();
         }
 
         fontConfig.destroy();
@@ -942,8 +948,12 @@ public class ReplayUI {
         GLFW.glfwMakeContextCurrent(ctx);
 
         var drawData = ImGui.getDrawData();
-        if (drawData != null && !VULKANMOD_PRESENT) {
-            imguiGl3.renderDrawData(drawData);
+        if (drawData != null) {
+            if (!VULKANMOD_PRESENT) {
+                imguiGl3.renderDrawData(drawData);
+            } else if (imguiVulkan != null) {
+                imguiVulkan.renderDrawData(drawData);
+            }
         }
 
         if (frameX != oldFrameX || frameY != oldFrameY || frameWidth != oldFrameWidth || frameHeight != oldFrameHeight) {
