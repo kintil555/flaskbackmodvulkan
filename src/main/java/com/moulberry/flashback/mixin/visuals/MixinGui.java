@@ -40,14 +40,12 @@ public abstract class MixinGui {
     private boolean shouldHideElements = false;
 
     @Inject(method = "render", at = @At("RETURN"))
-    public void render_vulkanDrawOverlay(GuiGraphics guiGraphics, DeltaTracker deltaTracker, CallbackInfo ci) {
-        // Vulkan path: ImGui is rendered here, inside Gui.render(), where VulkanMod's
-        // GL compat / RenderType pipeline is fully active. We pass GuiGraphics so that
-        // ImGuiMcRenderer can use VertexConsumer for Vulkan-safe rendering.
-        if (net.fabricmc.loader.api.FabricLoader.getInstance().isModLoaded("vulkanmod")) {
-            ReplayUI.currentGuiGraphics = guiGraphics;
-            ReplayUI.drawOverlay();
-        }
+    public void render_drawOverlay(GuiGraphics guiGraphics, DeltaTracker deltaTracker, CallbackInfo ci) {
+        // Draw ImGui overlay at the end of Gui.render().
+        // For VulkanMod: this call happens inside VulkanMod's MainPass, where the GL
+        // compatibility layer (VkGl* classes) is active and intercepts all raw GL calls
+        // that CustomImGuiImplGl3 makes (glDrawElements, glBindTexture, etc.).
+        ReplayUI.drawOverlay();
     }
 
     @Inject(method = "render", at = @At("HEAD"))
