@@ -548,7 +548,9 @@ public class ReplayUI {
 
         init();
 
-        GlStateManager._disableColorLogicOp(); // Needed on 1.21.5 because vanilla doesn't reset this after rendering
+        if (!VULKANMOD_PRESENT) {
+            GlStateManager._disableColorLogicOp(); // Needed on 1.21.5 because vanilla doesn't reset this after rendering
+        }
 
         long oldImGuiContext = ImGui.getCurrentContext().ptr;
         ImGui.setCurrentContext(imGuiContext);
@@ -942,10 +944,12 @@ public class ReplayUI {
         ImGui.render();
         ImGuiHelper.endFrame();
 
-        long ctx = GLFW.glfwGetCurrentContext();
-        ImGui.updatePlatformWindows();
-        ImGui.renderPlatformWindowsDefault();
-        GLFW.glfwMakeContextCurrent(ctx);
+        if (!VULKANMOD_PRESENT) {
+            long ctx = GLFW.glfwGetCurrentContext();
+            ImGui.updatePlatformWindows();
+            ImGui.renderPlatformWindowsDefault();
+            GLFW.glfwMakeContextCurrent(ctx);
+        }
 
         var drawData = ImGui.getDrawData();
         if (drawData != null) {

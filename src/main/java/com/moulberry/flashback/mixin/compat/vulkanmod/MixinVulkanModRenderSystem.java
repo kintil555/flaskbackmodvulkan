@@ -2,6 +2,7 @@ package com.moulberry.flashback.mixin.compat.vulkanmod;
 
 import com.moulberry.flashback.editor.ui.ReplayUI;
 import com.moulberry.mixinconstraints.annotations.IfModLoaded;
+import net.minecraft.client.Minecraft;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Pseudo;
 import org.spongepowered.asm.mixin.injection.At;
@@ -11,31 +12,41 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 /**
  * VulkanMod replaces Minecraft's OpenGL renderer with Vulkan.
  *
- * Critically, VulkanMod's MinecraftMixin does:
- *   1. @Inject beginFrame() at HEAD of runTick → acquires swapchain image, starts recording
- *   2. @Redirect blitToScreen()                → NO-OP (removed entirely)
- *   3. @Redirect glfwSwapBuffers               → endFrame() = submit commands + present
+ * VulkanMod's MinecraftMixin does:
+ *   1. @Inject preInitFrame() at HEAD of runTick → resource uploads/reset
+ *   2. @Inject beginFrame() at HEAD of runTick   → acquires swapchain image, starts recording
+ *   3. @Redirect blitToScreen()                  → VulkanMod's own blit: copies mainRenderTarget → swapchain
+ *   4. @Redirect glfwSwapBuffers                 → endFrame() = submit commands + present
  *
- * This means BEFORE/AFTER blitToScreen inject points are useless — blitToScreen
- * never runs. VulkanMod renders directly to its Vulkan swapchain image, bypassing
- * mainRenderTarget for final output. ImGui rendering to mainRenderTarget is invisible.
+ * The correct hook point is BEFORE blitToScreen() — at that moment:
+ *   - The game has fully rendered to mainRenderTarget
+ *   - VulkanMod hasn't yet copied mainRenderTarget to the swapchain
  *
- * FIX: Hook Renderer.endFrame() at HEAD — VulkanMod's command buffer is still
- * recording at this point. Our Blaze3D RenderPass calls (ImGuiVulkanRenderer)
- * get recorded into the same command buffer and appear in the final frame.
+ * By rendering ImGui into mainRenderTarget at this point, VulkanMod's blit
+ * automatically carries our ImGui overlay to the final swapchain image.
+ *
+ * Hooking endFrame() is too late — the frame is already submitted/presented.
  */
 @IfModLoaded("vulkanmod")
-@Pseudo
-@Mixin(targets = "net.vulkanmod.vulkan.Renderer", remap = false)
+@Mixin(value = Minecraft.class, priority = 900)
 public class MixinVulkanModRenderSystem {
 
     /**
-     * Render the Flashback ImGui overlay just before VulkanMod submits
-     * and presents the frame. require=0 so a future VulkanMod rename
-     * silently skips this rather than crashing.
+     * Render the Flashback ImGui overlay into mainRenderTarget just before
+     * VulkanMod's blitToScreen redirect copies mainRenderTarget → swapchain.
+     * This ensures ImGui is included in the final presented frame.
      */
-    @Inject(method = "endFrame", at = @At("HEAD"), require = 0)
-    public void flashback$onEndFrame(CallbackInfo ci) {
+    @Inject(
+        method = "runTick",
+        at = @At(
+            value = "INVOKE",
+            target = "Lcom/mojang/blaze3d/pipeline/RenderTarget;blitToScreen()V",
+            shift = At.Shift.BEFORE
+        ),
+        require = 0
+    )
+    public void flashback$beforeBlitToScreen(boolean bl, CallbackInfo ci) {
+        if (!net.minecraft.client.renderer.RenderSystem.isOnRenderThread()) return;
         ReplayUI.drawOverlay();
     }
 }
